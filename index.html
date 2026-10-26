@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Inkling World</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #001a33; /* Fallback dark blue */
+            font-family: 'Inter', sans-serif;
+            touch-action: none; /* Prevent pull-to-refresh on mobile canvas */
+        }
+
+        #bg-video {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100vw;
+            height: 100vh;
+            object-fit: cover;
+            z-index: -1;
+            pointer-events: none;
+        }
+
+        #ocean-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* Let clicks pass through to canvas/ui if overlapping */
+            overflow: hidden;
+            z-index: 10;
+        }
+
+        .creature-wrapper {
+            position: absolute;
+            top: 0;
+            left: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            /* We use will-change for smoother animations */
+            will-change: transform;
+            /* Transition property is handled in JS for dynamic durations */
+        }
+
+        .creature-img {
+            width: 50px;
+            height: 50px;
+            object-fit: contain;
+            /* Adding a subtle drop shadow makes the drawings pop against the bright water */
+            filter: drop-shadow(0px 2px 4px rgba(0,0,0,0.5));
+        }
+
+        .creature-name {
+            margin-top: 4px;
+            font-size: 12px;
+            color: #ffffff;
+            background-color: rgba(0, 0, 0, 0.4);
+            padding: 2px 6px;
+            border-radius: 8px;
+            text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+            white-space: nowrap;
+            font-weight: 500;
+        }
+
+        #ui-panel {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            backdrop-filter: blur(8px);
+            border-radius: 16px;
+            padding: 16px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+            z-index: 50;
+            width: calc(100% - 40px);
+            max-width: 250px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            transition: transform 0.3s ease;
+        }
+
+        #drawing-canvas {
+            background: #ffffff;
+            border: 2px dashed #cbd5e1;
+            border-radius: 8px;
+            cursor: crosshair;
+            width: 100%;
+            touch-action: none;
+        }
+
+        /* Custom scrollbar for mobile safety if needed */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <!-- Background Video -->
+    <video id="bg-video" autoplay muted loop playsinline>
+        <source src="gemini_generated_video_977bdb10.mp4" type="video/mp4">
+    </video>
+
+    <!-- Ocean for Creatures -->
+    <div id="ocean-container"></div>
+
+    <!-- UI Overlay for Drawing -->
+    <div id="ui-panel">
+        <div class="flex justify-between items-center">
+            <h2 class="text-sm font-bold text-gray-800">New Creature</h2>
+            <button id="btn-clear" class="text-xs text-red-500 hover:text-red-700 font-medium">Clear</button>
+        </div>
+        
+        <canvas id="drawing-canvas" width="200" height="200" class="shadow-inner"></canvas>
+        
+        <div class="flex gap-2 items-center">
+            <label for="color-picker" class="text-xs text-gray-600 font-medium">Color:</label>
+            <input type="color" id="color-picker" value="#000000" class="w-8 h-8 rounded cursor-pointer border-0 p-0">
+        </div>
+
+        <input type="text" id="nickname-input" placeholder="Nickname" maxlength="15" 
+               class="w-full px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-400">
+        
+        <button id="btn-release" class="w-full bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg shadow-md transition-colors text-sm">
+            Release Creature
+        </button>
+
+        <div id="status-msg" class="text-xs text-center text-gray-500 hidden">Connecting...</div>
+    </div>
+
+    <!-- Firebase and App Logic -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, addDoc, onSnapshot, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Firebase Configuration ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'inkling-world-default';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {
+            // Mock config to prevent crash if not injected, though it will fail to connect.
+            projectId: 'mock-project'
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        
+        // Collection path per strict rules
+        const creaturesCollectionRef = collection(db, 'artifacts', appId, 'public', 'data', 'creatures');
+
+        // --- UI & Canvas Setup ---
+        const canvas = document.getElementById('drawing-canvas');
+        const ctx = canvas.getContext('2d');
+        const colorPicker = document.getElementById('color-picker');
+        const btnClear = document.getElementById('btn-clear');
+        const btnRelease = document.getElementById('btn-release');
+        const nicknameInput = document.getElementById('nickname-input');
+        const statusMsg = document.getElementById('status-msg');
+        const oceanContainer = document.getElementById('ocean-container');
+
+        let isDrawing = false;
+        let userAuth = null;
+        const activeCreatures = new Map(); // Keep track of rendered DOM elements
+
+        // Initialize Canvas state
+        function initCanvas() {
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.lineWidth = 4;
+            clearCanvas();
+        }
+
+        function clearCanvas() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+
+        function getMousePos(evt) {
+            const rect = canvas.getBoundingClientRect();
+            // Scale correctly if canvas display size differs from internal size
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            let clientX, clientY;
+
+            if (evt.touches) {
+                clientX = evt.touches[0].clientX;
+                clientY = evt.touches[0].clientY;
+            } else {
+                clientX = evt.clientX;
+                clientY = evt.clientY;
+            }
+
+            return {
+                x: (clientX - rect.left) * scaleX,
+                y: (clientY - rect.top) * scaleY
+            };
+        }
+
+        function startDrawing(e) {
+            e.preventDefault();
+            isDrawing = true;
+            const pos = getMousePos(e);
+            ctx.strokeStyle = colorPicker.value;
+            ctx.beginPath();
+            ctx.moveTo(pos.x, pos.y);
+        }
+
+        function draw(e) {
+            if (!isDrawing) return;
+            e.preventDefault();
+            const pos = getMousePos(e);
+            ctx.lineTo(pos.x, pos.y);
+            ctx.stroke();
+        }
+
+        function stopDrawing(e) {
+            if(e) e.preventDefault();
+            isDrawing = false;
+        }
+
+        canvas.addEventListener('mousedown', startDrawing);
+        canvas.addEventListener('mousemove', draw);
+        canvas.addEventListener('mouseup', stopDrawing);
+        canvas.addEventListener('mouseleave', stopDrawing);
+        canvas.addEventListener('touchstart', startDrawing, { passive: false });
+        canvas.addEventListener('touchmove', draw, { passive: false });
+        canvas.addEventListener('touchend', stopDrawing);
+        
+        btnClear.addEventListener('click', clearCanvas);
+
+        // --- Check Canvas empty ---
+        function isCanvasBlank() {
+            const blank = document.createElement('canvas');
+            blank.width = canvas.width;
+            blank.height = canvas.height;
+            return canvas.toDataURL() === blank.toDataURL();
+        }
+
+        // --- Release Logic ---
+        btnRelease.addEventListener('click', async () => {
+            if (!userAuth) {
+                alert("Still connecting to the ocean... please wait.");
+                return;
+            }
+
+            const nickname = nicknameInput.value.trim();
+            if (!nickname) {
+                alert("Please give your creature a nickname!");
+                return;
+            }
+
+            if (isCanvasBlank()) {
+                alert("Please draw your creature first!");
+                return;
+            }
+
+            // Get Data URL
+            const imageDataUrl = canvas.toDataURL('image/png');
+
+            btnRelease.disabled = true;
+            btnRelease.textContent = "Releasing...";
+
+            try {
+                await addDoc(creaturesCollectionRef, {
+                    nickname: nickname,
+                    image: imageDataUrl,
+                    userId: userAuth.uid,
+                    createdAt: serverTimestamp()
+                });
+
+                // Reset UI on success
+                clearCanvas();
+                nicknameInput.value = '';
+                btnRelease.textContent = "Release Creature";
+                btnRelease.disabled = false;
+            } catch (err) {
+                console.error("Error releasing creature:", err);
+                alert("Failed to release creature. Is the connection okay?");
+                btnRelease.textContent = "Release Creature";
+                btnRelease.disabled = false;
+            }
+        });
+
+
+        // --- Swimming Animation Logic ---
+        function getRandomPosition() {
+            // Creature wrapper is roughly 50px wide and 80px tall (50img + padding + text)
+            const margin = 100; 
+            const maxX = window.innerWidth - margin;
+            const maxY = window.innerHeight - margin;
+            
+            return {
+                x: Math.max(20, Math.random() * maxX),
+                y: Math.max(20, Math.random() * maxY)
+            };
+        }
+
+        function swimToNewPosition(element) {
+            // 1. Calculate random new position
+            const newPos = getRandomPosition();
+            
+            // 2. Pick random duration between 4s and 8s
+            const durationSec = 4 + (Math.random() * 4);
+            
+            // 3. Apply styles
+            element.style.transition = `transform ${durationSec}s ease-in-out`;
+            element.style.transform = `translate(${newPos.x}px, ${newPos.y}px)`;
+
+            // 4. Listen for completion to loop
+            const onTransitionEnd = () => {
+                element.removeEventListener('transitionend', onTransitionEnd);
+                // Pause slightly before moving again (500ms to 2000ms)
+                const pauseMs = 500 + (Math.random() * 1500);
+                setTimeout(() => {
+                    // Only continue if the element is still in the DOM
+                    if (document.contains(element)) {
+                        swimToNewPosition(element);
+                    }
+                }, pauseMs);
+            };
+
+            element.addEventListener('transitionend', onTransitionEnd);
+        }
+
+        function spawnCreature(id, data) {
+            // Create container
+            const wrapper = document.createElement('div');
+            wrapper.className = 'creature-wrapper';
+            wrapper.id = `creature-${id}`;
+
+            // Initial random spawn point without animation transition
+            const initialPos = getRandomPosition();
+            wrapper.style.transform = `translate(${initialPos.x}px, ${initialPos.y}px)`;
+            wrapper.style.transition = 'none';
+
+            // Create Image
+            const img = document.createElement('img');
+            img.className = 'creature-img';
+            img.src = data.image;
+            img.alt = data.nickname;
+
+            // Create Name label
+            const nameLabel = document.createElement('div');
+            nameLabel.className = 'creature-name';
+            nameLabel.textContent = data.nickname;
+
+            // Assemble
+            wrapper.appendChild(img);
+            wrapper.appendChild(nameLabel);
+            oceanContainer.appendChild(wrapper);
+            activeCreatures.set(id, wrapper);
+
+            // Force reflow so the initial position registers before we apply the transition
+            void wrapper.offsetWidth; 
+
+            // Start swimming!
+            swimToNewPosition(wrapper);
+        }
+
+        function removeCreature(id) {
+            const wrapper = activeCreatures.get(id);
+            if (wrapper) {
+                wrapper.remove();
+                activeCreatures.delete(id);
+            }
+        }
+
+
+        // --- Initialization and Auth ---
+        async function initApp() {
+            statusMsg.classList.remove('hidden');
+            try {
+                // Handle Authentication
+                const initialToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                if (initialToken) {
+                    await signInWithCustomToken(auth, initialToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                userAuth = auth.currentUser;
+                statusMsg.classList.add('hidden');
+
+                // Start listening to the ocean
+                listenToOcean();
+                
+            } catch (error) {
+                console.error("Auth error:", error);
+                statusMsg.textContent = "Connection failed";
+                statusMsg.classList.remove('hidden');
+            }
+        }
+
+        function listenToOcean() {
+            // We fetch all creatures and listen for updates
+            onSnapshot(creaturesCollectionRef, (snapshot) => {
+                snapshot.docChanges().forEach((change) => {
+                    if (change.type === 'added') {
+                        spawnCreature(change.doc.id, change.doc.data());
+                    }
+                    if (change.type === 'removed') {
+                        removeCreature(change.doc.id);
+                    }
+                    // Ignoring 'modified' for now as drawing/name don't change
+                });
+            }, (error) => {
+                console.error("Firestore Error:", error);
+            });
+        }
+
+        // Run
+        initCanvas();
+        initApp();
+        
+    </script>
+</body>
+</html>
